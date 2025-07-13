@@ -7,6 +7,7 @@ resampy
 openai
 ollama
 requests
+pyannote.audio
 --extra-index-url https://download.pytorch.org/whl/cu128
 torch
 torchvision

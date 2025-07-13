@@ -2,12 +2,12 @@ import requests
 from openai import OpenAI
 
 # --- Ollama Local LLM Summarization ---
-def summarize_with_ollama(transcript_text, model="llama3", url="http://localhost:11434/api/generate"):
+def summarize_with_ollama(transcript_text, model="gemma3:12b", url="http://localhost:11434/api/generate"):
     """
     Generates a summary using a local Ollama model.
     Assumes Ollama is running and the specified model is available.
     """
-    prompt = f"Please provide a concise summary of the following meeting transcript:\n\n{transcript_text}"
+    prompt = f"Please provide a concise summary of the following meeting transcript and end the summary with a bulleted list on what we have to do:\n\n{transcript_text}"
     try:
         response = requests.post(
             url,
@@ -45,3 +45,22 @@ def summarize_with_openai(transcript_text, api_key):
         return summary, None
     except Exception as e:
         return None, f"An error occurred with OpenAI API: {e}"
+    
+if __name__ == "__main__":
+    # Example usage
+    transcript = "This is a sample meeting transcript that needs to be summarized."
+    
+    # Summarize using Ollama
+    ollama_summary, ollama_error = summarize_with_ollama(transcript)
+    if ollama_error:
+        print(f"Ollama Error: {ollama_error}")
+    else:
+        print(f"Ollama Summary: {ollama_summary}")
+    
+    # Summarize using OpenAI
+    openai_api_key = "your_openai_api_key_here"  # Replace with your actual OpenAI API key
+    openai_summary, openai_error = summarize_with_openai(transcript, openai_api_key)
+    if openai_error:
+        print(f"OpenAI Error: {openai_error}")
+    else:
+        print(f"OpenAI Summary: {openai_summary}")
