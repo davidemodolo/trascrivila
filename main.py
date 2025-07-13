@@ -19,7 +19,6 @@ torch.backends.cudnn.allow_tf32 = True
 import sounddevice as sd
 import resampy
 
-# --- NEW: Imports for Diarization ---
 from pyannote.audio import Pipeline
 import wave
 
@@ -31,7 +30,6 @@ IS_GPU_AVAILABLE = torch.cuda.is_available()
 print(f"[INFO] CUDA available: {IS_GPU_AVAILABLE}")
 
 
-# --- NEW: Confirmation Dialog Class ---
 class ConfirmationDialog(ctk.CTkToplevel):
     def __init__(self, parent, title, message):
         super().__init__(parent)
@@ -72,24 +70,25 @@ class App(ctk.CTk):
         self.geometry("1100x800")
 
         self.is_recording = False
-        self.is_paused = False  # NEW: Pause state
+        self.is_paused = False
         self.app_running = True
         self.gui_queue = queue.Queue()
         self.mic_data_queue = queue.Queue()
         self.sys_data_queue = queue.Queue()
         self.capture_threads = {"mic": {"thread": None, "stop_event": threading.Event()}, "sys": {"thread": None, "stop_event": threading.Event()}}
         self.processor_threads = []
-        self.transcript_data = {"mic": [], "sys": []}
         self.last_interim_text = {"mic": "", "sys": ""}
         self.whisper_model = None
         self.current_model_name = ""
         self.whisper_lock = threading.Lock()
 
-        # --- NEW: Diarization attributes ---
+        self.combined_transcript = []
+        self.recording_start_time = None
+        self.sys_transcript_with_timestamps = [] # Still needed for post-processing
+
         self.diarization_pipeline = None
         self.sys_audio_for_diarization = []
-        self.sys_transcript_with_timestamps = []
-        self.speaker_colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"] # Predefined colors for speakers
+        self.speaker_colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
 
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.setup_ui()
@@ -98,7 +97,7 @@ class App(ctk.CTk):
         self.after(50, self.process_gui_queue)
         self.populate_device_menus()
         self.load_whisper_model()
-        self.load_diarization_pipeline() # NEW: Load diarization model on start
+        self.load_diarization_pipeline()
         self.start_capture_threads()
 
     def setup_ui(self):
@@ -106,7 +105,6 @@ class App(ctk.CTk):
         self.top_frame = ctk.CTkFrame(self, corner_radius=10); self.top_frame.grid(row=0, column=0, columnspan=2, padx=10, pady=10, sticky="ew")
         self.top_frame.grid_columnconfigure(3, weight=1)
 
-        # --- MODIFIED: Added Pause button ---
         self.toggle_button = ctk.CTkButton(self.top_frame, text="Start Recording", command=self.toggle_recording, width=150); self.toggle_button.grid(row=0, column=0, padx=10, pady=10)
         self.pause_button = ctk.CTkButton(self.top_frame, text="Pause", command=self.toggle_pause, state="disabled"); self.pause_button.grid(row=0, column=1, padx=(0,10), pady=10)
 
@@ -119,7 +117,6 @@ class App(ctk.CTk):
         ctk.CTkLabel(self.device_frame, text="System Audio (Monitor):").grid(row=0, column=2, padx=(10,0))
         self.sys_device_menu = ctk.CTkOptionMenu(self.device_frame, values=["loading..."], command=self.on_sys_device_change); self.sys_device_menu.grid(row=0, column=3, padx=10, pady=10, sticky="ew")
 
-        # --- NEW: UI for number of speakers ---
         ctk.CTkLabel(self.device_frame, text="Speakers:").grid(row=0, column=4, padx=(10,0))
         self.num_speakers_entry = ctk.CTkEntry(self.device_frame, width=50); self.num_speakers_entry.grid(row=0, column=5, padx=(0,10), pady=10)
         self.num_speakers_entry.insert(0, "2")
@@ -243,7 +240,6 @@ class App(ctk.CTk):
             if parec: parec.terminate(); parec.wait()
         print(f"[{source_name.upper()}] Capture thread stopped.")
 
-    # --- MODIFIED: toggle_recording logic ---
     def toggle_recording(self):
         if self.is_recording:
             self.stop_recording()
@@ -257,7 +253,6 @@ class App(ctk.CTk):
             else:
                 self.start_recording()
 
-    # --- NEW: toggle_pause logic ---
     def toggle_pause(self):
         if not self.is_recording: return
         self.is_paused = not self.is_paused
@@ -272,16 +267,17 @@ class App(ctk.CTk):
         if self.whisper_model is None:
             self.update_status("Error: Whisper model not loaded.", "red"); return
         
-        self.transcript_data = {"mic": [], "sys": []}
-        self.last_interim_text = {"mic": "", "sys": ""}
-        self.sys_audio_for_diarization = []
+        self.combined_transcript = []
+        self.recording_start_time = time.time()
         self.sys_transcript_with_timestamps = []
+        self.sys_audio_for_diarization = []
+        self.last_interim_text = {"mic": "", "sys": ""}
 
         for textbox in [self.mic_textbox, self.sys_textbox]:
             textbox.configure(state="normal"); textbox.delete("1.0", "end"); textbox.configure(state="disabled")
         
         self.toggle_button.configure(text="Stop Recording", fg_color="#DB4437", hover_color="#C53727")
-        self.pause_button.configure(state="normal", text="Pause") # Enable pause button
+        self.pause_button.configure(state="normal", text="Pause")
         for widget in [self.summary_button, self.export_button, self.language_menu, self.mic_device_menu, self.sys_device_menu, self.num_speakers_entry]:
             widget.configure(state="disabled")
         
@@ -301,18 +297,15 @@ class App(ctk.CTk):
         self.update_status("Status: Finalizing...", "orange")
 
     def on_recording_finished(self):
-        # --- MODIFIED: Trigger diarization ---
         if self.diarization_pipeline and self.sys_transcript_with_timestamps:
             self.update_status("Status: Diarizing...", "orange")
             self.pause_button.configure(state="disabled", text="Pause")
             self.toggle_button.configure(state="disabled")
             threading.Thread(target=self.run_diarization, daemon=True).start()
         else:
-            self.gui_queue.put({"type": "diarization_finished"}) # Skip if no pipeline or text
+            self.gui_queue.put({"type": "diarization_finished"})
 
-    # --- MODIFIED: on_language_change ---
     def on_language_change(self, choice):
-        # We now check the model type (multilingual or english-only) before reloading
         new_model_name = "base.en" if choice == "english" else "base"
         if self.current_model_name != new_model_name:
             self.load_whisper_model()
@@ -338,13 +331,10 @@ class App(ctk.CTk):
                 self.whisper_model = None; self.current_model_name = ""
         threading.Thread(target=load, daemon=True).start()
 
-    # --- NEW: Diarization model loading ---
     def load_diarization_pipeline(self):
         self.update_status("Loading diarization model...", "orange")
         def load():
             try:
-                # IMPORTANT: This requires a Hugging Face token.
-                # Run `huggingface-cli login` in your terminal first.
                 self.diarization_pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization")
                 if IS_GPU_AVAILABLE:
                     self.diarization_pipeline.to(torch.device("cuda"))
@@ -372,7 +362,6 @@ class App(ctk.CTk):
                     if is_final:
                         textbox.insert("end", "\n\n")
                         self.last_interim_text[source] = ""
-                        self.transcript_data[source].append(text)
                     else:
                         self.last_interim_text[source] = text
                     textbox.configure(state="disabled"); textbox.yview_moveto(1.0)
@@ -385,7 +374,6 @@ class App(ctk.CTk):
                 elif msg_type == "summary_result":
                     self.summary_textbox.configure(state="normal"); self.summary_textbox.delete("1.0", "end"); self.summary_textbox.insert("1.0", msg.get("data", "No summary returned.")); self.summary_textbox.configure(state="disabled")
                     self.summary_button.configure(state="normal", text="Generate Summary")
-                # --- NEW: Handle diarization completion ---
                 elif msg_type == "diarization_finished":
                     self.update_status("Status: Idle", "gray")
                     self.toggle_button.configure(state="normal", text="Start Recording", fg_color=ctk.ThemeManager.theme["CTkButton"]["fg_color"], hover_color=ctk.ThemeManager.theme["CTkButton"]["hover_color"])
@@ -394,8 +382,9 @@ class App(ctk.CTk):
                             widget.configure(state="normal")
                     print("[INFO] Recording and Diarization session finished.")
                 elif msg_type == "diarization_update":
+                    # This message type now receives a full phrase
                     self.sys_textbox.configure(state="normal")
-                    self.sys_textbox.insert("end", msg["word"] + " ", (f"speaker_{msg['speaker']}",))
+                    self.sys_textbox.insert("end", msg['text'] + "\n\n", (f"speaker_{msg['speaker_idx']}",))
                     self.sys_textbox.configure(state="disabled")
                     self.sys_textbox.yview_moveto(1.0)
         except queue.Empty: pass
@@ -409,7 +398,6 @@ class App(ctk.CTk):
         print(f"[{source_name.upper()}] Processor thread started.")
         
         while self.is_recording:
-            # --- MODIFIED: Check for pause state ---
             if self.is_paused:
                 time.sleep(0.1); continue
 
@@ -433,16 +421,25 @@ class App(ctk.CTk):
                 if (time_since_interim > INTERIM_TIMEOUT or is_final) and audio_buffer.size > 1000:
                     lang = self.language_menu.get() if self.language_menu.get() != "english" else None
                     with self.whisper_lock:
-                        # --- MODIFIED: Get word timestamps for diarization ---
                         result = self.whisper_model.transcribe(audio_buffer, language=lang, fp16=IS_GPU_AVAILABLE, word_timestamps=True)
                     text = result['text'].strip()
 
                     if text:
                         self.gui_queue.put({"type": "transcript_update", "source": source_name, "text": text, "is_final": is_final})
-                        # --- NEW: Store data for diarization ---
-                        if is_final and source_name == 'sys':
-                            self.sys_transcript_with_timestamps.extend(result['segments'])
-                            self.sys_audio_for_diarization.append(audio_buffer.copy())
+                        if is_final:
+                            # --- MODIFIED: Add to combined transcript data ---
+                            if source_name == 'mic':
+                                buffer_duration = audio_buffer.size / WHISPER_SAMPLE_RATE
+                                buffer_start_time = time.time() - buffer_duration
+                                for segment in result['segments']:
+                                    self.combined_transcript.append({
+                                        "start": buffer_start_time + segment['start'],
+                                        "speaker": "mic",
+                                        "text": segment['text'].strip()
+                                    })
+                            elif source_name == 'sys':
+                                self.sys_transcript_with_timestamps.extend(result['segments'])
+                                self.sys_audio_for_diarization.append(audio_buffer.copy())
 
                     last_interim_time = now
 
@@ -453,7 +450,6 @@ class App(ctk.CTk):
                 time.sleep(0.1)
             except Exception as e: print(f"[{source_name.upper()}] Processor error: {e}"); traceback.print_exc(); break
 
-        # Final processing after recording stops
         while not data_queue.empty():
             try: audio_buffer = np.concatenate((audio_buffer, data_queue.get_nowait().flatten()))
             except queue.Empty: break
@@ -465,7 +461,16 @@ class App(ctk.CTk):
             text = result['text'].strip()
             if text:
                 self.gui_queue.put({"type": "transcript_update", "source": source_name, "text": text, "is_final": True})
-                if source_name == 'sys':
+                if source_name == 'mic':
+                    buffer_duration = audio_buffer.size / WHISPER_SAMPLE_RATE
+                    buffer_start_time = time.time() - buffer_duration
+                    for segment in result['segments']:
+                        self.combined_transcript.append({
+                            "start": buffer_start_time + segment['start'],
+                            "speaker": "mic",
+                            "text": segment['text'].strip()
+                        })
+                elif source_name == 'sys':
                     self.sys_transcript_with_timestamps.extend(result['segments'])
                     self.sys_audio_for_diarization.append(audio_buffer.copy())
 
@@ -473,7 +478,6 @@ class App(ctk.CTk):
         if all(not t.is_alive() for t in self.processor_threads if t is not threading.current_thread()):
              self.gui_queue.put({"type": "processors_finished"})
 
-    # --- NEW: Diarization execution method ---
     def run_diarization(self):
         temp_wav_path = f"temp_diarization_audio_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
         try:
@@ -489,44 +493,52 @@ class App(ctk.CTk):
             print(f"[INFO] Running diarization for {num_speakers or 'an unknown number of'} speakers...")
             diarization = self.diarization_pipeline(temp_wav_path, num_speakers=num_speakers)
 
-            # Clear sys textbox and configure color tags
+            all_words = [word for segment in self.sys_transcript_with_timestamps for word in segment.get('words', [])]
+            if not all_words: 
+                print("[INFO] No words with timestamps found for diarization."); return
+
+            diarized_phrases = []
+            current_phrase = None
+            for word_info in all_words:
+                word_text = word_info['word']
+                mid_time = (word_info['start'] + word_info['end']) / 2.0
+                
+                speaker_label = "UNKNOWN"
+                for turn, _, label in diarization.itertracks(yield_label=True):
+                    if turn.start <= mid_time <= turn.end: speaker_label = label; break
+                
+                if current_phrase and current_phrase["speaker"] == speaker_label:
+                    current_phrase["text"] += " " + word_text
+                else:
+                    if current_phrase: diarized_phrases.append(current_phrase)
+                    current_phrase = {"start": word_info['start'], "speaker": speaker_label, "text": word_text}
+            if current_phrase: diarized_phrases.append(current_phrase)
+            
+            for phrase in diarized_phrases:
+                self.combined_transcript.append({
+                    "start": self.recording_start_time + phrase['start'],
+                    "speaker": phrase['speaker'],
+                    "text": phrase['text'].strip()
+                })
+
             self.sys_textbox.configure(state="normal"); self.sys_textbox.delete("1.0", "end")
-            speaker_tag_map = {}
+            
+            unique_speakers = sorted(list({p['speaker'] for p in diarized_phrases}))
+            speaker_to_idx_map = {name: i for i, name in enumerate(unique_speakers)}
+
             for i, color in enumerate(self.speaker_colors):
-                tag_name = f"speaker_{i}"
-                self.sys_textbox.tag_config(tag_name, foreground=color)
+                self.sys_textbox.tag_config(f"speaker_{i}", foreground=color)
 
-            full_diarized_text = []
-            for segment in self.sys_transcript_with_timestamps:
-                for word_info in segment['words']:
-                    word = word_info['word']
-                    mid_time = (word_info['start'] + word_info['end']) / 2.0
-                    
-                    speaker_label = "UNKNOWN"
-                    for turn, _, label in diarization.itertracks(yield_label=True):
-                        if turn.start <= mid_time <= turn.end:
-                            speaker_label = label
-                            break
-                    
-                    if speaker_label not in speaker_tag_map:
-                        speaker_tag_map[speaker_label] = len(speaker_tag_map)
-                    
-                    speaker_index = speaker_tag_map[speaker_label] % len(self.speaker_colors)
-                    
-                    self.gui_queue.put({"type": "diarization_update", "word": word, "speaker": speaker_index})
-                    full_diarized_text.append(f"[{speaker_label}] {word}")
-
-            self.transcript_data["sys"] = [" ".join(full_diarized_text)] # Update transcript data with diarized version
-            self.sys_textbox.configure(state="disabled")
+            for phrase in diarized_phrases:
+                speaker_idx = speaker_to_idx_map.get(phrase['speaker'], 0) % len(self.speaker_colors)
+                display_text = f"[{phrase['speaker']}] {phrase['text']}"
+                self.gui_queue.put({"type": "diarization_update", "text": display_text, "speaker_idx": speaker_idx})
+            
             print("[INFO] Diarization complete.")
 
         except Exception as e:
             print(f"[ERROR] Diarization failed: {e}"); traceback.print_exc()
             self.gui_queue.put({"type": "status_update", "text": "Diarization failed.", "color": "red"})
-            # If diarization fails, put back the old text
-            self.sys_textbox.configure(state="normal"); self.sys_textbox.delete("1.0", "end")
-            self.sys_textbox.insert("1.0", "\n\n".join(self.transcript_data["sys"]))
-            self.sys_textbox.configure(state="disabled")
         finally:
             if os.path.exists(temp_wav_path): os.remove(temp_wav_path)
             self.gui_queue.put({"type": "diarization_finished"})
@@ -538,11 +550,17 @@ class App(ctk.CTk):
         threading.Thread(target=self.run_summary_generation, daemon=True).start()
 
     def run_summary_generation(self):
-        mic_text = "\n".join(self.transcript_data["mic"]).strip(); sys_text = "\n".join(self.transcript_data["sys"]).strip()
-        full_transcript = f"--- USER/MICROPHONE TRANSCRIPT ---\n{mic_text}\n\n--- CALL/SYSTEM AUDIO TRANSCRIPT ---\n{sys_text}"
-        if not (mic_text or sys_text):
+        if not self.combined_transcript:
             self.gui_queue.put({"type": "summary_result", "data": "Transcript is empty."})
             return
+
+        sorted_transcript = sorted(self.combined_transcript, key=lambda x: x['start'])
+        full_transcript = "\n".join([f"{item['speaker']}: {item['text']}" for item in sorted_transcript])
+
+        if not full_transcript.strip():
+            self.gui_queue.put({"type": "summary_result", "data": "Transcript is empty."})
+            return
+        
         api_key = self.api_key_entry.get().strip()
         self.update_status("Attempting local summary (Ollama)...", "blue")
         summary, error = summarize_with_ollama(full_transcript)
@@ -557,12 +575,30 @@ class App(ctk.CTk):
         self.gui_queue.put({"type": "summary_result", "data": summary})
 
     def export_transcript(self):
-        export_data = {"metadata": {"export_time": datetime.now().isoformat(), "language": self.language_menu.get()}, "microphone_transcript": self.transcript_data["mic"], "system_audio_transcript": self.transcript_data["sys"]}
-        if not export_data["microphone_transcript"] and not export_data["system_audio_transcript"]:
+        if not self.combined_transcript:
             self.update_status("Nothing to export.", "orange"); return
-        filepath = f"transcript_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+
+        # Sort the combined transcript by the start timestamp
+        sorted_transcript = sorted(self.combined_transcript, key=lambda x: x['start'])
+
+        # Create a mapping for speaker labels to be more user-friendly
+        unique_sys_speakers = sorted(list({item['speaker'] for item in sorted_transcript if item['speaker'] != 'mic'}))
+        speaker_map = {label: f"speaker {i+1}" for i, label in enumerate(unique_sys_speakers)}
+        speaker_map['mic'] = 'mic'
+
+        # Format the transcript into the desired sequential flow
+        transcript_flow = []
+        for item in sorted_transcript:
+            label = speaker_map.get(item['speaker'], item['speaker'])
+            transcript_flow.append(f"{label}: {item['text']}")
+
+        final_transcript_string = "\n".join(transcript_flow)
+
+        # Save to a .txt file
+        filepath = f"transcript_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         try:
-            with open(filepath, "w", encoding='utf-8') as f: json.dump(export_data, f, indent=4)
+            with open(filepath, "w", encoding='utf-8') as f:
+                f.write(final_transcript_string)
             print(f"[INFO] Transcript exported to {os.path.abspath(filepath)}")
             self.update_status(f"Exported to {os.path.basename(filepath)}", "green")
         except Exception as e:

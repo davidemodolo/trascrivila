@@ -8,4 +8,4 @@ How to run:
 
 
 Missing:
-Give each speaker a name -> Provide the llm with the flow of the call to summarize what everyone said, the general topic and a bulleted list on what everyone has to do.
+Give each speaker a name and keep the UNK as UNK
