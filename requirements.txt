@@ -1,0 +1,13 @@
+customtkinter
+numpy
+openai-whisper
+sounddevice
+resampy
+# If summarizer.py uses OpenAI or Ollama APIs, also include:
+openai
+ollama
+requests
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch
+torchvision
+torchaudio
